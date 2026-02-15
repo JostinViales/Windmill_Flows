@@ -1,35 +1,8 @@
-"""
-Parse bank transaction emails to extract transaction details.
-
-This script uses regex patterns to extract amount, merchant, date,
-and other transaction details from bank notification emails.
-
-Supports:
-- BAC Costa Rica (Banco de América Central) - Spanish notifications
-- US banks (Chase, BofA, Wells Fargo, Capital One, Citi)
-- Generic fallback for other banks
-"""
-
 import re
-import json
-from typing import TypedDict, Optional
-from datetime import datetime
-
-
-class TransactionData(TypedDict):
-    """Parsed transaction data structure."""
-    email_id: str
-    date: str
-    amount: float
-    merchant: str
-    card_last_4: str
-    transaction_type: str  # DEBIT or CREDIT
-    raw_text: str
-    confidence: float  # 0.0 to 1.0 confidence in parsing
-
+import quopri
+from typing import TypedDict, List, Optional
 
 class EmailMessage(TypedDict):
-    """Input email message structure."""
     id: str
     thread_id: str
     subject: str
@@ -38,334 +11,340 @@ class EmailMessage(TypedDict):
     body_text: str
     body_html: str
 
+class TransactionData(TypedDict):
+    email_id: str
+    date: str
+    amount: float
+    currency: str
+    merchant: str
+    card_last_4: str
+    transaction_type: str
+    confidence: float
+    raw_text: str
+
+def decode_quoted_printable(text: str) -> str:
+    """Decode quoted-printable encoding (e.g., =3D becomes =)."""
+    try:
+        # Handle quoted-printable encoding
+        decoded = quopri.decodestring(text.encode('latin-1')).decode('utf-8', errors='ignore')
+        return decoded
+    except:
+        return text
 
 def clean_html(html: str) -> str:
-    """
-    Convert HTML to readable text by removing tags and cleaning up.
-    Better than the basic strip used in the fetch script.
-    """
+    """Clean and decode HTML content."""
     if not html:
         return ""
+    
+    # Decode quoted-printable encoding
+    html = decode_quoted_printable(html)
+    
+    # Remove soft line breaks (=\n)
+    html = re.sub(r'=\s*\n', '', html)
+    
+    return html
 
-    # Remove style and script blocks entirely
-    text = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
-
-    # Replace common block elements with newlines
-    text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'</(p|div|tr|li|h[1-6])>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<td[^>]*>', ' | ', text, flags=re.IGNORECASE)
-
-    # Remove remaining HTML tags
-    text = re.sub(r'<[^>]+>', ' ', text)
-
-    # Decode common HTML entities
-    text = text.replace('&nbsp;', ' ')
-    text = text.replace('&amp;', '&')
-    text = text.replace('&lt;', '<')
-    text = text.replace('&gt;', '>')
-    text = text.replace('&quot;', '"')
-    text = text.replace('&#39;', "'")
-    text = text.replace('&apos;', "'")
-
-    # Collapse whitespace
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'\n\s*\n', '\n', text)
-
-    return text.strip()
-
-
-def parse_bac_costa_rica(email_msg: dict) -> Optional[dict]:
-    """
-    Parse BAC Costa Rica bank notification emails.
-
-    Subject format: "Notificación de transacción MERCHANT DD-MM-YYYY - HH:MM"
-    Body contains: amount, card info, and transaction details in Spanish/HTML
-    """
-    subject = email_msg.get("subject", "")
-    body_html = email_msg.get("body_html", "")
-    body_text = email_msg.get("body_text", "")
-
-    # Use HTML body as primary source (body_text often has CSS artifacts for BAC)
-    clean_body = clean_html(body_html) if body_html else body_text
-
-    # Combine all text for searching
-    full_text = f"{subject}\n{clean_body}"
-
-    print(f"  [BAC CR] Parsing: {subject[:80]}")
-    print(f"  [BAC CR] Clean body length: {len(clean_body)} chars")
-    print(f"  [BAC CR] Clean body preview: {clean_body[:300]}...")
-
-    # --- Extract MERCHANT from subject ---
-    # Pattern: "Notificación de transacción MERCHANT DD-MM-YYYY"
-    merchant = "Unknown Merchant"
-    merchant_match = re.search(
-        r'[Nn]otificaci[oó]n\s+de\s+transacci[oó]n\s+(.+?)\s+\d{2}-\d{2}-\d{4}',
-        subject
-    )
-    if merchant_match:
-        merchant = merchant_match.group(1).strip()
-        print(f"  [BAC CR] Merchant from subject: {merchant}")
-
-    # --- Extract DATE from subject ---
-    date_str = ""
-    date_match = re.search(r'(\d{2})-(\d{2})-(\d{4})', subject)
-    if date_match:
-        day, month, year = date_match.group(1), date_match.group(2), date_match.group(3)
-        date_str = f"{year}-{month}-{day}"  # Convert DD-MM-YYYY to YYYY-MM-DD
-        print(f"  [BAC CR] Date from subject: {date_str}")
-    else:
-        # Fallback to email date header
-        try:
-            from email.utils import parsedate_to_datetime
-            parsed = parsedate_to_datetime(email_msg.get("date", ""))
-            date_str = parsed.strftime("%Y-%m-%d")
-        except Exception:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-
-    # --- Extract AMOUNT from body ---
-    # BAC CR uses various formats: ₡1,234.56 or $1,234.56 or USD 1,234.56 or CRC 1,234.56
-    amount = 0.0
-    amount_found = False
-
-    # Try multiple amount patterns (most specific first)
-    amount_patterns = [
-        # Colones/Dollars with currency symbol: ₡1,234.56 or $1,234.56
-        r'[₡$¢]\s*([0-9]{1,3}(?:[,.]?\d{3})*(?:[.,]\d{2}))',
-        # With currency code: USD 1,234.56 or CRC 1,234.56
-        r'(?:USD|CRC|US\$)\s*([0-9]{1,3}(?:[,.]?\d{3})*(?:[.,]\d{2}))',
-        # "Monto" (amount in Spanish): Monto: 1,234.56 or Monto 1234.56
-        r'[Mm]onto[:\s]+[₡$]?\s*([0-9]{1,3}(?:[,.]?\d{3})*(?:[.,]\d{2}))',
-        # "Cantidad" (quantity/amount in Spanish)
-        r'[Cc]antidad[:\s]+[₡$]?\s*([0-9]{1,3}(?:[,.]?\d{3})*(?:[.,]\d{2}))',
-        # "Total" field
-        r'[Tt]otal[:\s]+[₡$]?\s*([0-9]{1,3}(?:[,.]?\d{3})*(?:[.,]\d{2}))',
-        # Generic dollar/colon amount
-        r'([0-9]{1,3}(?:,\d{3})*\.\d{2})',
+def extract_amount(text: str, html: str = "") -> Optional[tuple]:
+    """Extract amount and currency from text or HTML."""
+    # Clean HTML first
+    html_clean = clean_html(html)
+    combined = f"{text} {html_clean}"
+    
+    print(f"   🔍 Searching for amount...")
+    print(f"   Raw HTML sample: {html[:200]}")
+    print(f"   Cleaned HTML sample: {html_clean[:200]}")
+    
+    # Pattern 1: Most specific - Monto: in table row with amount in next cell
+    # Handles: <td><p>Monto:</p></td><td...><p>CRC 1,850.00</p></td>
+    monto_patterns = [
+        # Pattern for table structure with Monto label
+        r'<p>\s*Monto:\s*</p>\s*</td>\s*<td[^>]*>\s*<p>\s*(CRC|USD|₡|US\$|\$)?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*[,\.][0-9]{2})\s*</p>',
+        # More flexible pattern
+        r'Monto:\s*</p>.*?<p>\s*(CRC|USD|₡|US\$|\$)?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*[,\.][0-9]{2})\s*</p>',
+        # Even more flexible - just look for Monto: followed by currency and amount
+        r'Monto:.*?(CRC|USD|₡|US\$|\$)\s*([0-9]{1,3}(?:[,\.][0-9]{3})*[,\.][0-9]{2})',
     ]
-
-    for pattern in amount_patterns:
-        match = re.search(pattern, full_text)
+    
+    for i, pattern in enumerate(monto_patterns):
+        match = re.search(pattern, html_clean, re.IGNORECASE | re.DOTALL)
         if match:
-            amount_str = match.group(1).replace(",", "")
-            try:
-                amount = float(amount_str)
-                if amount > 0:
-                    amount_found = True
-                    print(f"  [BAC CR] Amount found: {amount} (pattern: {pattern[:30]}...)")
-                    break
-            except ValueError:
-                continue
-
-    # --- Extract CARD last 4 digits ---
-    card_last_four = ""
-    card_patterns = [
-        r'(?:tarjeta|card|ending|terminada?\s+en|xxxx)\s*[:\s]*\*{0,4}\s*(\d{4})',
-        r'\*{4}(\d{4})',
-        r'[Xx]{4}(\d{4})',
-        r'(?:terminaci[oó]n|final)\s*[:\s]*(\d{4})',
+            groups = match.groups()
+            currency = groups[0] if groups[0] else 'CRC'
+            amount_str = groups[1]
+            
+            # Normalize currency
+            if currency in ['₡', 'CRC']:
+                currency = 'CRC'
+            elif currency in ['$', 'US$', 'USD']:
+                currency = 'USD'
+            
+            # Parse amount
+            parsed_amount = parse_amount_string(amount_str)
+            if parsed_amount:
+                print(f"   ✅ Found amount via Monto pattern {i+1}: {currency} {parsed_amount}")
+                return float(parsed_amount), currency, 1.0
+    
+    # Pattern 2: Look for currency followed by amount anywhere
+    currency_patterns = [
+        (r'CRC\s*([0-9]{1,3}(?:[,\.][0-9]{3})*[,\.][0-9]{2})', 'CRC'),
+        (r'USD\s*([0-9]{1,3}(?:[,\.][0-9]{3})*[,\.][0-9]{2})', 'USD'),
+        (r'₡\s*([0-9]{1,3}(?:[,\.][0-9]{3})*[,\.][0-9]{2})', 'CRC'),
+        (r'\$\s*([0-9]{1,3}(?:[,\.][0-9]{3})*[,\.][0-9]{2})', 'USD'),
     ]
-    for pattern in card_patterns:
-        match = re.search(pattern, full_text, re.IGNORECASE)
+    
+    for pattern, curr in currency_patterns:
+        match = re.search(pattern, combined, re.IGNORECASE)
         if match:
-            card_last_four = match.group(1)
-            print(f"  [BAC CR] Card last 4: {card_last_four}")
-            break
+            amount_str = match.group(1)
+            parsed_amount = parse_amount_string(amount_str)
+            if parsed_amount:
+                print(f"   ✅ Found amount via currency pattern: {curr} {parsed_amount}")
+                return float(parsed_amount), curr, 0.9
+    
+    print("   ❌ No amount pattern matched")
+    return None
 
-    # --- Determine transaction type ---
+def parse_amount_string(amount_str: str) -> Optional[str]:
+    """Parse amount string handling different decimal/thousand separators."""
+    if ',' in amount_str and '.' in amount_str:
+        # Both present - determine which is decimal
+        if amount_str.rindex(',') > amount_str.rindex('.'):
+            # Comma is last, so it's decimal (European style)
+            amount_str = amount_str.replace('.', '').replace(',', '.')
+        else:
+            # Period is last, so it's decimal (US style)
+            amount_str = amount_str.replace(',', '')
+    elif ',' in amount_str:
+        # Only comma - check if it's decimal or thousands
+        parts = amount_str.split(',')
+        if len(parts[-1]) == 2:
+            # Last part is 2 digits, likely decimal
+            amount_str = amount_str.replace(',', '.')
+        else:
+            # Likely thousands separator
+            amount_str = amount_str.replace(',', '')
+    
+    try:
+        amount = float(amount_str)
+        if amount > 0:
+            return amount_str
+    except ValueError:
+        pass
+    
+    return None
+
+def extract_merchant(text: str, html: str = "", subject: str = "") -> Optional[tuple]:
+    """Extract merchant name from text, HTML, or subject."""
+    # Clean HTML first
+    html_clean = clean_html(html)
+    
+    print(f"   🔍 Searching for merchant...")
+    print(f"   Raw HTML sample: {html[:200]}")
+    print(f"   Cleaned HTML sample: {html_clean[:200]}")
+    
+    # Pattern 1: Most specific - Comercio: in table row with merchant in next cell
+    # Handles: <td><p>Comercio:</p></td><td...><p>CARIARI MARKET</p></td>
+    comercio_patterns = [
+        # Pattern for table structure with Comercio label
+        r'<p>\s*Comercio:\s*</p>\s*</td>\s*<td[^>]*>\s*<p>\s*([A-ZÁÉÍÓÚÑa-záéíóúñ0-9][A-ZÁÉÍÓÚÑa-záéíóúñ0-9\s&\.\-]{2,100}?)\s*</p>',
+        # More flexible pattern
+        r'Comercio:\s*</p>.*?<p>\s*([A-ZÁÉÍÓÚÑa-záéíóúñ0-9][A-ZÁÉÍÓÚÑa-záéíóúñ0-9\s&\.\-]{2,100}?)\s*</p>',
+        # Even more flexible - just look for Comercio: followed by merchant name
+        r'Comercio:.*?<p>\s*([A-ZÁÉÍÓÚÑa-záéíóúñ0-9][A-ZÁÉÍÓÚÑa-záéíóúñ0-9\s&\.\-]{2,100}?)\s*</p>',
+    ]
+    
+    for i, pattern in enumerate(comercio_patterns):
+        match = re.search(pattern, html_clean, re.IGNORECASE | re.DOTALL)
+        if match:
+            merchant = match.group(1).strip()
+            # Clean up merchant name
+            merchant = re.sub(r'\s+', ' ', merchant)
+            merchant = re.sub(r'[,\.\-<>]+$', '', merchant)
+            if len(merchant) >= 3:
+                print(f"   ✅ Found merchant via Comercio pattern {i+1}: {merchant}")
+                return merchant, 1.0
+    
+    # Pattern 2: Try subject - often has merchant name
+    subject_match = re.search(r'(?:transacci[oó]n|transaction)\s+(.+?)\s+\d{1,2}-\d{1,2}-\d{4}', subject, re.IGNORECASE)
+    if subject_match:
+        merchant = subject_match.group(1).strip()
+        if len(merchant) >= 3:
+            print(f"   ✅ Found merchant in subject: {merchant}")
+            return merchant, 0.95
+    
+    # Pattern 3: General patterns
+    combined = f"{text} {html_clean}"
+    patterns = [
+        r'(?:comercio|establecimiento)[:\s]+([A-ZÁÉÍÓÚÑa-záéíóúñ0-9][A-ZÁÉÍÓÚÑa-záéíóúñ0-9\s&\.\-]{2,50})(?:\s+|<|$)',
+        r'(?:at|from|merchant)[:\s]+([A-Z][A-Za-z0-9\s&\.\-]{2,50})(?:\s+|<|$)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, combined, re.IGNORECASE)
+        if match:
+            merchant = match.group(1).strip()
+            merchant = re.sub(r'\s+', ' ', merchant)
+            merchant = re.sub(r'[,\.\-<>]+$', '', merchant)
+            merchant = re.sub(r'<[^>]+>', '', merchant)
+            if len(merchant) >= 3:
+                print(f"   ✅ Found merchant via general pattern: {merchant}")
+                return merchant, 0.8
+    
+    print("   ⚠️ No merchant pattern matched")
+    return None
+
+def extract_card_last_4(text: str, html: str = "") -> Optional[tuple]:
+    """Extract last 4 digits of card."""
+    html = clean_html(html)
+    combined = f"{text} {html}"
+    
+    patterns = [
+        r'\*+(\d{4})',
+        r'x{4,}(\d{4})',
+        r'(?:MASTER|VISA|tarjeta|card).*?(\d{4})',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, combined, re.IGNORECASE)
+        if match:
+            return match.group(1), 1.0
+    
+    return None
+
+def extract_transaction_type(text: str, html: str = "") -> tuple:
+    """Determine if transaction is DEBIT or CREDIT."""
+    combined = f"{text} {html}".lower()
+    
     debit_keywords = [
-        "compra", "purchase", "cargo", "débito", "debito", "retiro",
-        "withdrawal", "pago", "payment", "cobro", "charge", "spent",
-        "cajero", "atm"
+        'compra', 'purchase', 'debit', 'd[eé]bito', 'retiro', 'withdrawal', 
+        'pago', 'payment', 'cargo', 'charge', 'gasto', 'spent'
     ]
     credit_keywords = [
-        "crédito", "credito", "credit", "depósito", "deposito", "deposit",
-        "abono", "reembolso", "refund", "devolución", "devolucion"
+        'cr[eé]dito', 'credit', 'dep[oó]sito', 'deposit', 'reembolso', 
+        'refund', 'devoluci[oó]n', 'abono', 'payment received'
     ]
+    
+    for keyword in debit_keywords:
+        if re.search(keyword, combined):
+            return 'DEBIT', 0.9
+    
+    for keyword in credit_keywords:
+        if re.search(keyword, combined):
+            return 'CREDIT', 0.9
+    
+    return 'DEBIT', 0.3
 
-    text_lower = full_text.lower()
-    debit_score = sum(1 for kw in debit_keywords if kw in text_lower)
-    credit_score = sum(1 for kw in credit_keywords if kw in text_lower)
-    transaction_type = "CREDIT" if credit_score > debit_score else "DEBIT"
-
-    # --- Calculate confidence ---
-    confidence = 0.0
-    if merchant != "Unknown Merchant":
-        confidence += 0.3
-    if date_str:
-        confidence += 0.2
-    if amount_found:
-        confidence += 0.4
-    if card_last_four:
-        confidence += 0.1
-
-    return {
-        "merchant": merchant,
-        "date": date_str,
-        "amount": amount,
-        "card_last_4": card_last_four,
-        "transaction_type": transaction_type,
-        "confidence": confidence,
-        "raw_text": full_text[:500]
-    }
-
-
-def parse_generic(email_msg: dict) -> Optional[dict]:
-    """
-    Generic email parser for US banks and unknown formats.
-    """
-    subject = email_msg.get("subject", "")
-    body_text = email_msg.get("body_text", "")
-    body_html = email_msg.get("body_html", "")
-
-    # If body_text looks like CSS/garbage, try HTML
-    if body_text and body_text.strip().startswith("@media"):
-        body_text = clean_html(body_html) if body_html else ""
-
-    full_text = f"{subject} {body_text}"
-
-    # Amount
-    amount = 0.0
-    amount_match = re.search(r'\$([0-9,]+\.[0-9]{2})', full_text)
-    if amount_match:
-        amount = float(amount_match.group(1).replace(",", ""))
-
-    # Merchant
-    merchant = "Unknown Merchant"
-    merchant_patterns = [
-        r'(?:at|from|to|with)\s+([A-Za-z0-9\s&\'\-\.]+?)(?:\s+on|\s+for|\s+\$|\.|,|$)',
-        r'(?:merchant|comercio)[:\s]+([A-Za-z0-9\s&\'\-\.]+?)(?:\s|$)',
+def extract_date(text: str, html: str = "", email_date: str = "") -> tuple:
+    """Extract transaction date from text/HTML or use email date."""
+    html = clean_html(html)
+    combined = f"{text} {html}"
+    
+    patterns = [
+        r'Fecha:\s*</p>.*?<p>\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4},\s+\d{2}:\d{2})',
+        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dic)\s+\d{1,2},\s+\d{4}',
+        r'(\d{1,2}/\d{1,2}/\d{2,4})',
+        r'(\d{4}-\d{2}-\d{2})',
+        r'(\d{1,2}-\d{1,2}-\d{2,4})',
     ]
-    for pattern in merchant_patterns:
-        match = re.search(pattern, full_text, re.IGNORECASE)
+    
+    for pattern in patterns:
+        match = re.search(pattern, combined, re.IGNORECASE | re.DOTALL)
         if match:
-            merchant = match.group(1).strip()[:50]
-            break
+            return match.group(1), 0.8
+    
+    return email_date, 0.5
 
-    # Date
-    date_str = ""
-    date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', full_text)
-    if date_match:
-        raw_date = date_match.group(1)
-        for fmt in ["%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%d/%m/%Y"]:
-            try:
-                parsed = datetime.strptime(raw_date, fmt)
-                date_str = parsed.strftime("%Y-%m-%d")
-                break
-            except ValueError:
-                continue
-    if not date_str:
-        try:
-            from email.utils import parsedate_to_datetime
-            parsed = parsedate_to_datetime(email_msg.get("date", ""))
-            date_str = parsed.strftime("%Y-%m-%d")
-        except Exception:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-
-    # Card last 4
-    card_last_four = ""
-    card_match = re.search(r'(?:ending in|card|xxxx)\s*(\d{4})', full_text, re.IGNORECASE)
-    if card_match:
-        card_last_four = card_match.group(1)
-
-    # Transaction type
-    text_lower = full_text.lower()
-    debit_kw = ["purchase", "spent", "charge", "debit", "withdrawal", "payment"]
-    credit_kw = ["credit", "deposit", "refund", "received", "cashback"]
-    transaction_type = "CREDIT" if sum(1 for k in credit_kw if k in text_lower) > sum(1 for k in debit_kw if k in text_lower) else "DEBIT"
-
-    confidence = 0.0
-    if amount > 0: confidence += 0.4
-    if merchant != "Unknown Merchant": confidence += 0.3
-    if date_str: confidence += 0.2
-    if card_last_four: confidence += 0.1
-
-    return {
-        "merchant": merchant,
+def parse_transaction(email: EmailMessage) -> Optional[TransactionData]:
+    """Parse a single email into transaction data."""
+    text = email.get('body_text', '')
+    html = email.get('body_html', '')
+    subject = email.get('subject', '')
+    
+    if not text and not html:
+        print(f"⚠️ Email {email['id']}: No content found")
+        return None
+    
+    print(f"\n📧 Parsing email {email['id']}")
+    print(f"   Subject: {subject[:100]}")
+    
+    # Extract components
+    amount_result = extract_amount(text, html)
+    merchant_result = extract_merchant(text, html, subject)
+    card_result = extract_card_last_4(text, html)
+    transaction_type, type_confidence = extract_transaction_type(text, html)
+    date_str, date_confidence = extract_date(text, html, email.get("date", ""))
+    
+    if not amount_result:
+        print("   ❌ FAILED: No amount found")
+        return None
+    
+    amount, currency, amount_confidence = amount_result
+    print(f"   ✅ Amount: {currency} {amount}")
+    
+    confidence_scores = [amount_confidence, type_confidence, date_confidence]
+    
+    if merchant_result:
+        merchant, merchant_confidence = merchant_result
+        confidence_scores.append(merchant_confidence)
+        print(f"   ✅ Merchant: {merchant}")
+    else:
+        merchant = "Unknown Merchant"
+        print(f"   ⚠️ Merchant: Not found (using default)")
+    
+    if card_result:
+        card_last_4, card_confidence = card_result
+        confidence_scores.append(card_confidence)
+        print(f"   ✅ Card: ****{card_last_4}")
+    else:
+        card_last_4 = "****"
+    
+    overall_confidence = sum(confidence_scores) / len(confidence_scores)
+    
+    transaction: TransactionData = {
+        "email_id": email["id"],
         "date": date_str,
         "amount": amount,
-        "card_last_4": card_last_four,
+        "currency": currency,
+        "merchant": merchant,
+        "card_last_4": card_last_4,
         "transaction_type": transaction_type,
-        "confidence": confidence,
-        "raw_text": full_text[:500]
+        "confidence": round(overall_confidence, 2),
+        "raw_text": subject[:200]
     }
+    
+    print(f"   ✅ SUCCESS: Parsed with confidence {transaction['confidence']}")
+    
+    return transaction
 
-
-def detect_bank(sender: str) -> str:
-    """Detect which bank sent the email based on sender address."""
-    sender_lower = sender.lower()
-
-    bank_map = {
-        "notificacionesbaccr": "bac_cr",
-        "baborigen": "bac_cr",
-        "baccredomatic": "bac_cr",
-        "chase.com": "chase",
-        "bankofamerica": "bofa",
-        "wellsfargo": "wells_fargo",
-        "capitalone": "capital_one",
-        "citi.com": "citi",
-    }
-
-    for pattern, bank_id in bank_map.items():
-        if pattern in sender_lower:
-            return bank_id
-
-    return "generic"
-
-
-def main(emails: list[EmailMessage]) -> list[TransactionData]:
+def main(emails: List[EmailMessage]) -> List[TransactionData]:
     """
-    Parse a list of bank emails and extract transaction data.
-
+    Parse transaction details from email bodies.
+    
     Args:
-        emails: List of email messages from fetch_bank_emails
-
+        emails: List of EmailMessage dictionaries
+    
     Returns:
-        List of parsed transaction data
+        List of TransactionData dictionaries
     """
+    print(f"🔍 Parsing {len(emails)} emails...")
+    
     if not emails:
-        print("No emails to parse")
+        print("⚠️ No emails to parse")
         return []
-
-    print(f"Parsing {len(emails)} email(s)...")
-    transactions: list[TransactionData] = []
-
-    for email_msg in emails:
+    
+    transactions = []
+    
+    for email in emails:
         try:
-            # Detect bank
-            bank_id = detect_bank(email_msg.get("sender", ""))
-            print(f"\nProcessing email from bank: {bank_id}")
-            print(f"  Subject: {email_msg.get('subject', '')[:80]}")
-
-            # Parse based on bank
-            if bank_id == "bac_cr":
-                parsed = parse_bac_costa_rica(email_msg)
-            else:
-                parsed = parse_generic(email_msg)
-
-            if parsed is None:
-                print(f"  SKIPPED: Could not parse email {email_msg.get('id', '?')}")
-                continue
-
-            transaction: TransactionData = {
-                "email_id": email_msg.get("id", ""),
-                "date": parsed["date"],
-                "amount": parsed["amount"],
-                "merchant": parsed["merchant"],
-                "card_last_4": parsed["card_last_4"],
-                "transaction_type": parsed["transaction_type"],
-                "raw_text": parsed["raw_text"],
-                "confidence": parsed["confidence"]
-            }
-
-            transactions.append(transaction)
-            print(f"  ✓ Parsed: ${parsed['amount']:.2f} at {parsed['merchant']} on {parsed['date']} ({parsed['transaction_type']})")
-
+            transaction = parse_transaction(email)
+            if transaction:
+                transactions.append(transaction)
         except Exception as e:
-            print(f"  ERROR parsing email {email_msg.get('id', '?')}: {e}")
+            print(f"❌ Error parsing email {email.get('id', 'unknown')}: {e}")
             import traceback
             traceback.print_exc()
             continue
-
-    print(f"\nTotal parsed: {len(transactions)} transaction(s)")
+    
+    print(f"\n✅ Successfully parsed {len(transactions)} transactions out of {len(emails)} emails")
+    
     return transactions

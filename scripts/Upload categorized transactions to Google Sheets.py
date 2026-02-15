@@ -1,208 +1,147 @@
-"""
-Upload categorized transactions to Google Sheets.
-
-This script appends transaction records to a Google Sheets spreadsheet
-using Windmill's Google Sheets OAuth resource.
-"""
-
 import requests
-from typing import TypedDict
+from typing import TypedDict, List
 from datetime import datetime
 
-
 class gsheets(TypedDict):
-    """Windmill gsheets resource type. Class name must match the resource type."""
     token: str
 
-
-class CategorizedTransaction(TypedDict):
-    """Input categorized transaction structure."""
+class TransactionData(TypedDict):
     email_id: str
     date: str
     amount: float
     merchant: str
-    card_last_four: str
+    card_last_4: str
     transaction_type: str
-    raw_description: str
-    parsing_confidence: float
-    category: str
-    category_emoji: str
-    category_confidence: float
+    confidence: float
+    raw_text: str
 
-
-def ensure_headers(
-    api_headers: dict,
-    spreadsheet_id: str,
-    sheet_name: str
-) -> bool:
+def get_or_create_headers(token: str, spreadsheet_id: str, sheet_name: str) -> bool:
     """
-    Ensure the spreadsheet has the correct headers.
-    Creates headers if the sheet is empty.
+    Check if headers exist, create them if not.
+    
+    Returns:
+        True if headers were created, False if they already existed
     """
-    base_url = "https://sheets.googleapis.com/v4/spreadsheets"
-    range_spec = f"{sheet_name}!A1:I1"
-
-    # Check if headers exist
-    response = requests.get(
-        f"{base_url}/{spreadsheet_id}/values/{range_spec}",
-        headers=api_headers
-    )
-
-    if response.status_code == 200:
-        data = response.json()
-        if data.get("values"):
-            print("Headers already exist")
-            return True
-
-    # Create headers
-    header_values = [
-        [
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    # Get first row to check for headers
+    range_name = f"{sheet_name}!A1:H1"
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{range_name}"
+    
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    
+    data = response.json()
+    
+    # If no values or first row is empty, create headers
+    if "values" not in data or not data["values"]:
+        header_row = [
             "Processed Date",
             "Transaction Date",
             "Merchant",
             "Amount",
-            "Category",
             "Type",
-            "Card (Last 4)",
+            "Card Last 4",
             "Confidence",
             "Description"
         ]
-    ]
-
-    update_response = requests.put(
-        f"{base_url}/{spreadsheet_id}/values/{range_spec}",
-        headers=api_headers,
-        params={"valueInputOption": "USER_ENTERED"},
-        json={"values": header_values}
-    )
-
-    if update_response.status_code == 200:
-        print("Headers created successfully")
+        
+        body = {
+            "values": [header_row]
+        }
+        
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{range_name}?valueInputOption=RAW"
+        response = requests.put(url, headers=headers, json=body)
+        response.raise_for_status()
+        
         return True
-    else:
-        print(f"Failed to create headers: {update_response.status_code} - {update_response.text}")
-        return False
+    
+    return False
 
+def append_transactions(token: str, spreadsheet_id: str, sheet_name: str, transactions: List[TransactionData]) -> dict:
+    """
+    Append transactions to Google Sheets.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    # Prepare rows
+    rows = []
+    email_ids = []
+    processed_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    for transaction in transactions:
+        row = [
+            processed_date,
+            transaction["date"],
+            transaction["merchant"],
+            transaction["amount"],
+            transaction["transaction_type"],
+            transaction["card_last_4"],
+            transaction["confidence"],
+            transaction["raw_text"]
+        ]
+        rows.append(row)
+        email_ids.append(transaction["email_id"])
+    
+    if not rows:
+        return {
+            "success": True,
+            "rows_added": 0,
+            "email_ids": []
+        }
+    
+    # Append to sheet
+    range_name = f"{sheet_name}!A:H"
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{range_name}:append?valueInputOption=RAW"
+    
+    body = {
+        "values": rows
+    }
+    
+    response = requests.post(url, headers=headers, json=body)
+    response.raise_for_status()
+    
+    result = response.json()
+    
+    return {
+        "success": True,
+        "rows_added": len(rows),
+        "email_ids": email_ids,
+        "updated_range": result.get("updates", {}).get("updatedRange", "")
+    }
 
 def main(
     gsheets_resource: gsheets,
-    transactions: list,
     spreadsheet_id: str,
-    sheet_name: str = "Expenses"
+    sheet_name: str,
+    transactions: List[TransactionData]
 ) -> dict:
     """
-    Upload categorized transactions to Google Sheets.
-
+    Upload transactions to Google Sheets.
+    
     Args:
-        gsheets_resource: Windmill Google Sheets OAuth resource
-        transactions: List of categorized transactions to upload
-        spreadsheet_id: ID of the Google Sheets spreadsheet
-        sheet_name: Name of the sheet/tab within the spreadsheet
-
+        gsheets_resource: Google Sheets OAuth token
+        spreadsheet_id: Google Sheets spreadsheet ID
+        sheet_name: Name of the sheet/tab to write to
+        transactions: List of parsed transactions
+    
     Returns:
-        Dictionary with upload results
+        Dictionary with success status, rows added, and email IDs
     """
-    print(f"Upload script received {len(transactions) if transactions else 0} transaction(s)")
-
-    if not transactions:
-        return {"success": True, "rows_added": 0, "message": "No transactions to upload", "email_ids": []}
-
-    # Debug: print first transaction structure
-    print(f"First transaction keys: {list(transactions[0].keys()) if isinstance(transactions[0], dict) else type(transactions[0])}")
-
-    # Build API headers
-    api_headers = {
-        "Authorization": f"Bearer {gsheets_resource['token']}",
-        "Content-Type": "application/json"
-    }
-
-    base_url = "https://sheets.googleapis.com/v4/spreadsheets"
-
+    token = gsheets_resource["token"]
+    
     # Ensure headers exist
-    print("Checking spreadsheet headers...")
-    ensure_headers(api_headers, spreadsheet_id, sheet_name)
-
-    # Prepare rows to append
-    rows = []
-    processed_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    for txn in transactions:
-        try:
-            # Safely access fields with defaults for resilience
-            amount = txn.get("amount", 0)
-            merchant = txn.get("merchant", "Unknown")
-            date = txn.get("date", "")
-            category = txn.get("category", "Uncategorized")
-            category_emoji = txn.get("category_emoji", "❓")
-            transaction_type = txn.get("transaction_type", "DEBIT")
-            card_last_four = txn.get("card_last_4", txn.get("card_last_four", ""))
-            raw_description = txn.get("raw_text", txn.get("raw_description", ""))
-
-            # Safely format confidence — handle both float and string
-            parsing_confidence = txn.get("confidence", txn.get("parsing_confidence", 0))
-            try:
-                confidence_str = f"{float(parsing_confidence):.0%}"
-            except (ValueError, TypeError):
-                confidence_str = str(parsing_confidence)
-
-            row = [
-                processed_time,
-                str(date),
-                str(merchant),
-                float(amount) if amount else 0,
-                f"{category_emoji} {category}",
-                str(transaction_type),
-                str(card_last_four),
-                confidence_str,
-                str(raw_description)[:100]
-            ]
-            rows.append(row)
-            print(f"  Prepared row: ${amount} at {merchant}")
-
-        except Exception as e:
-            print(f"  Error preparing row: {e} — transaction: {txn}")
-            continue
-
-    if not rows:
-        return {"success": False, "rows_added": 0, "message": "All transactions failed to prepare", "email_ids": []}
-
-    print(f"Appending {len(rows)} row(s) to {sheet_name}...")
-
-    # Use the :append endpoint — this is the correct Google Sheets API method
-    # for adding rows. PUT/update requires exact range and can silently fail.
-    append_url = f"{base_url}/{spreadsheet_id}/values/{sheet_name}!A1:I1:append"
-
-    response = requests.post(
-        append_url,
-        headers=api_headers,
-        params={
-            "valueInputOption": "USER_ENTERED",
-            "insertDataOption": "INSERT_ROWS"
-        },
-        json={"values": rows}
-    )
-
-    print(f"Sheets API response: {response.status_code}")
-    print(f"Response body: {response.text[:500]}")
-
-    if response.status_code == 200:
-        result = response.json()
-        updated_range = result.get("updates", {}).get("updatedRange", "unknown")
-        updated_rows = result.get("updates", {}).get("updatedRows", 0)
-        print(f"Successfully appended {updated_rows} row(s) to {updated_range}")
-
-        return {
-            "success": True,
-            "rows_added": len(rows),
-            "message": f"Added {len(rows)} transactions to {sheet_name}",
-            "email_ids": [txn.get("email_id", "") for txn in transactions]
-        }
-    else:
-        error_msg = f"Failed to upload: {response.status_code} - {response.text}"
-        print(error_msg)
-        return {
-            "success": False,
-            "rows_added": 0,
-            "message": error_msg,
-            "email_ids": []
-        }
+    headers_created = get_or_create_headers(token, spreadsheet_id, sheet_name)
+    
+    # Append transactions
+    result = append_transactions(token, spreadsheet_id, sheet_name, transactions)
+    
+    result["headers_created"] = headers_created
+    
+    return result

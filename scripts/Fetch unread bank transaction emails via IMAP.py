@@ -1,26 +1,15 @@
-"""
-Fetch bank notification emails from Gmail via IMAP.
-
-This script connects to Gmail using IMAP with an App Password
-and retrieves unread emails from your bank for processing.
-Uses Python's built-in imaplib and email modules — no external dependencies needed.
-"""
-
 import imaplib
 import email
 from email.header import decode_header
-from typing import TypedDict
-from datetime import datetime
-
+from typing import TypedDict, List
+import re
+from html import unescape
 
 class gmail_imap(TypedDict):
-    """Windmill resource type for Gmail IMAP credentials."""
     email: str
     app_password: str
 
-
 class EmailMessage(TypedDict):
-    """Parsed email message structure."""
     id: str
     thread_id: str
     subject: str
@@ -29,157 +18,166 @@ class EmailMessage(TypedDict):
     body_text: str
     body_html: str
 
-
 def decode_mime_header(header_value: str) -> str:
-    """Decode a MIME-encoded email header."""
+    """Decode MIME encoded email headers."""
     if not header_value:
         return ""
+    
     decoded_parts = decode_header(header_value)
     result = []
-    for part, charset in decoded_parts:
+    
+    for part, encoding in decoded_parts:
         if isinstance(part, bytes):
-            result.append(part.decode(charset or "utf-8", errors="ignore"))
+            try:
+                result.append(part.decode(encoding or 'utf-8', errors='ignore'))
+            except (UnicodeDecodeError, LookupError, AttributeError):
+                result.append(part.decode('utf-8', errors='ignore'))
         else:
-            result.append(part)
-    return " ".join(result)
+            result.append(str(part))
+    
+    return ''.join(result)
 
+def strip_html(html: str) -> str:
+    """Basic HTML tag removal."""
+    if not html:
+        return ""
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', html)
+    # Decode HTML entities
+    text = unescape(text)
+    # Clean up whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
-def extract_body(msg: email.message.Message) -> tuple[str, str]:
-    """Extract plain text and HTML body from an email message."""
+def extract_body(msg) -> tuple:
+    """Extract text and HTML body from email message."""
     body_text = ""
     body_html = ""
-
+    
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
             content_disposition = str(part.get("Content-Disposition", ""))
-
+            
             # Skip attachments
             if "attachment" in content_disposition:
                 continue
-
+            
             try:
                 payload = part.get_payload(decode=True)
-                if payload is None:
-                    continue
-                charset = part.get_content_charset() or "utf-8"
-                decoded = payload.decode(charset, errors="ignore")
-
-                if content_type == "text/plain":
-                    body_text = decoded
-                elif content_type == "text/html":
-                    body_html = decoded
-            except Exception:
+                if payload:
+                    charset = part.get_content_charset() or 'utf-8'
+                    decoded = payload.decode(charset, errors='ignore')
+                    
+                    if content_type == "text/plain":
+                        body_text = decoded
+                    elif content_type == "text/html":
+                        body_html = decoded
+            except (UnicodeDecodeError, LookupError, AttributeError):
                 continue
     else:
-        content_type = msg.get_content_type()
+        # Not multipart
         try:
             payload = msg.get_payload(decode=True)
             if payload:
-                charset = msg.get_content_charset() or "utf-8"
-                decoded = payload.decode(charset, errors="ignore")
-                if content_type == "text/plain":
+                charset = msg.get_content_charset() or 'utf-8'
+                decoded = payload.decode(charset, errors='ignore')
+                
+                if msg.get_content_type() == "text/plain":
                     body_text = decoded
-                elif content_type == "text/html":
+                elif msg.get_content_type() == "text/html":
                     body_html = decoded
-        except Exception:
+        except (UnicodeDecodeError, LookupError, AttributeError):
             pass
-
-    # If no plain text, strip HTML tags as fallback
+    
+    # If no text body, extract from HTML
     if not body_text and body_html:
-        import re
-        body_text = re.sub(r'<[^>]+>', ' ', body_html)
-        body_text = re.sub(r'\s+', ' ', body_text).strip()
-
+        body_text = strip_html(body_html)
+    
     return body_text, body_html
-
 
 def main(
     gmail_imap_resource: gmail_imap,
     bank_sender_email: str = "",
-    max_emails: int = 10,
-) -> list[EmailMessage]:
+    max_emails: int = 50
+) -> List[EmailMessage]:
     """
-    Fetch unread bank notification emails from Gmail via IMAP.
-
+    Fetch unread bank transaction emails via IMAP.
+    
     Args:
-        gmail_imap_resource: Windmill gmail_imap resource with email and app_password
-        bank_sender_email: Bank's sender email address (e.g., 'alerts@chase.com').
-                          If empty, fetches all unread emails.
-        max_emails: Maximum number of emails to fetch per run
-
+        gmail_imap_resource: Gmail IMAP credentials (email, app_password)
+        bank_sender_email: Optional filter for sender email (e.g., 'alerts@chase.com')
+        max_emails: Maximum number of emails to fetch
+    
     Returns:
-        List of email messages with parsed content
+        List of EmailMessage dictionaries
     """
-    user_email = gmail_imap_resource["email"]
+    email_address = gmail_imap_resource["email"]
     app_password = gmail_imap_resource["app_password"]
-
+    
     # Connect to Gmail IMAP
-    print(f"Connecting to Gmail IMAP as {user_email}...")
     mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-    mail.login(user_email, app_password)
+    mail.login(email_address, app_password)
+    
+    # Select inbox
     mail.select("INBOX")
-
+    
     # Build search criteria
     if bank_sender_email:
         search_criteria = f'(UNSEEN FROM "{bank_sender_email}")'
     else:
         search_criteria = "(UNSEEN)"
-
-    print(f"Searching with criteria: {search_criteria}")
-    status, message_numbers = mail.search(None, search_criteria)
-
-    if status != "OK" or not message_numbers[0]:
-        print("No new bank emails found")
+    
+    # Search for unread emails
+    status, message_ids = mail.search(None, search_criteria)
+    
+    if status != "OK":
         mail.logout()
         return []
-
-    # Get message IDs (most recent first)
-    msg_ids = message_numbers[0].split()
-    msg_ids = msg_ids[-max_emails:]  # Limit to max_emails (take most recent)
-    msg_ids.reverse()  # Most recent first
-
-    print(f"Found {len(msg_ids)} unread email(s)")
-
-    emails: list[EmailMessage] = []
-
-    for msg_id in msg_ids:
+    
+    email_ids = message_ids[0].split()
+    
+    # Limit to max_emails
+    email_ids = email_ids[:max_emails]
+    
+    emails = []
+    
+    for email_id in email_ids:
         try:
-            # Fetch email without marking as read (use BODY.PEEK)
-            status, msg_data = mail.fetch(msg_id, "(BODY.PEEK[])")
-
-            if status != "OK" or not msg_data[0]:
+            # Fetch email using BODY.PEEK to not mark as read
+            status, msg_data = mail.fetch(email_id, "(BODY.PEEK[])")
+            
+            if status != "OK":
                 continue
-
+            
+            # Parse email
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
-
-            # Parse headers
+            
+            # Extract headers
             subject = decode_mime_header(msg.get("Subject", ""))
             sender = decode_mime_header(msg.get("From", ""))
-            date_str = msg.get("Date", "")
-            message_id = msg.get("Message-ID", str(msg_id))
-
+            date = msg.get("Date", "")
+            message_id = msg.get("Message-ID", "")
+            thread_id = msg.get("Thread-Index", "") or message_id
+            
             # Extract body
             body_text, body_html = extract_body(msg)
-
-            email_msg: EmailMessage = {
-                "id": msg_id.decode("utf-8") if isinstance(msg_id, bytes) else str(msg_id),
-                "thread_id": message_id,
+            
+            emails.append({
+                "id": email_id.decode(),
+                "thread_id": thread_id,
                 "subject": subject,
                 "sender": sender,
-                "date": date_str,
+                "date": date,
                 "body_text": body_text,
-                "body_html": body_html,
-            }
-
-            emails.append(email_msg)
-            print(f"Fetched: {subject[:60]}...")
-
+                "body_html": body_html
+            })
         except Exception as e:
-            print(f"Error fetching email {msg_id}: {e}")
+            # Skip problematic emails
+            print(f"Error processing email {email_id}: {e}")
             continue
-
+    
     mail.logout()
-    print(f"Successfully fetched {len(emails)} email(s)")
+    
     return emails
