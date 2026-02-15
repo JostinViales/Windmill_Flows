@@ -1,0 +1,100 @@
+summary: Bank Expense Tracker - Automated expense tracking from bank email notifications
+description: |
+  This flow monitors your Gmail inbox for bank transaction notification emails,
+  parses the transaction details, categorizes expenses, and uploads them to
+  a Google Sheets spreadsheet for tracking.
+
+  Features:
+  - Automatic detection of bank emails from major US banks
+  - Regex-based extraction of amount, merchant, date, and card info
+  - Rule-based expense categorization with optional AI enhancement
+  - Google Sheets integration for expense logging
+  - Email labeling to prevent duplicate processing
+
+value:
+  modules:
+    # Step 1: Fetch unread bank emails from Gmail
+    - id: fetch_emails
+      value:
+        type: script
+        path: f/bank-expense-tracker/fetch_bank_emails
+        input_transforms:
+          gmail_imap_resource:
+            type: static
+            value: $res:u/gmail_imap_resource
+          bank_sender_email:
+            type: static
+            value: ""  # Leave empty to fetch all unread, or set your bank's email
+          max_emails:
+            type: static
+            value: 10
+
+    # Step 2: Parse transaction data from emails
+    - id: parse_transactions
+      value:
+        type: script
+        path: f/bank-expense-tracker/parse_transaction
+        input_transforms:
+          emails:
+            type: javascript
+            expr: results.fetch_emails
+
+    # Step 3: Categorize expenses
+    - id: categorize
+      value:
+        type: script
+        path: f/bank-expense-tracker/categorize_expense
+        input_transforms:
+          transactions:
+            type: javascript
+            expr: results.parse_transactions
+          use_ai_categorization:
+            type: static
+            value: false  # Set to true to enable Gemini AI categorization
+          gemini_api_key:
+            type: static
+            value: ""  # Add your Gemini API key here if using AI
+          ai_confidence_threshold:
+            type: static
+            value: 0.5
+
+    # Step 4: Upload to Google Sheets
+    - id: upload
+      value:
+        type: script
+        path: f/bank-expense-tracker/upload_to_sheets
+        input_transforms:
+          gsheets_resource:
+            type: static
+            value: $res:u/gsheets_resource
+          transactions:
+            type: javascript
+            expr: results.categorize
+          spreadsheet_id:
+            type: static
+            value: "YOUR_SPREADSHEET_ID_HERE"  # Replace with your Google Sheets ID
+          sheet_name:
+            type: static
+            value: "Expenses"
+
+    # Step 5: Mark emails as processed
+    - id: mark_processed
+      value:
+        type: script
+        path: f/bank-expense-tracker/mark_emails_processed
+        input_transforms:
+          gmail_imap_resource:
+            type: static
+            value: $res:u/gmail_imap_resource
+          email_ids:
+            type: javascript
+            expr: results.upload.email_ids || []
+          mark_as_read:
+            type: static
+            value: true
+
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties: {}
+  required: []
